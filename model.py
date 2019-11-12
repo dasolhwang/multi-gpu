@@ -296,7 +296,7 @@ class GPUNetworkBuilder(object):
         """Depthwise convolution"""
         num_inputs = input_layer.get_shape().as_list()[1]
         kernel_shape = [filter_size[0], filter_size[1],
-                        1, channel_multiplier]
+                        num_inputs, channel_multiplier]
         strides = [1, 1, filter_strides[0], filter_strides[1]]
         with tf.variable_scope(self._count_layer('dwconv')) as scope:
             kernel = self._get_variable('weights', kernel_shape,
@@ -328,8 +328,8 @@ class GPUNetworkBuilder(object):
         for idx, (input_tensor, filter_tensor) in enumerate(zip(input_list, filter_list)):
             with tf.variable_scope(self._count_layer('gconv2d')) as scope:
                 output_list.append(tf.nn.convolution(
-                    input_tensor, filter_tensor, filter_strides,
-                    padding, 'NCHW', dilation_rate))
+                    input_tensor, filter_tensor, padding, filter_strides,
+                    dilation_rate, data_format='NCHW'))
         x = tf.concat(output_list, axis=1)
         return x
 
@@ -508,30 +508,28 @@ def stage(tensors):
     return put_op, get_tensors
 
 def all_sync_params(tower_params, devices):
-    """Assigns the params from the first tower to all others"""
-    if len(devices) == 1:
-        return tf.no_op()
-    sync_ops = []
-    if have_nccl and FLAGS.nccl:
-        for param_on_devices in zip(*tower_params):
-            # Note: param_on_devices is [paramX_gpu0, paramX_gpu1, ...]
-            param0 = param_on_devices[0]
-            send_op, received_tensors = nccl_ops.broadcast(param0, devices[1:])
-            sync_ops.append(send_op)
-            for device, param, received in zip(devices[1:],
-                                               param_on_devices[1:],
-                                               received_tensors):
-                with tf.device(device):
-                    sync_op = param.assign(received)
-                    sync_ops.append(sync_op)
-    else:
-        params0 = tower_params[0]
-        for device, params in zip(devices, tower_params):
-            with tf.device(device):
-                for param, param0 in zip(params, params0):
-                    sync_op = param.assign(param0.read_value())
-                    sync_ops.append(sync_op)
-    return tf.group(*sync_ops)
+   if len(devices) == 1:
+       return tf.no_op()
+   sync_ops = []
+   # TODO(benbarsdell): Re-enable this once tf.contrib.nccl.broadcast is fixed
+   #                    See https://github.com/tensorflow/tensorflow/issues/15425#issuecomment-361835192
+   if False and have_nccl and FLAGS.nccl:
+       for param_on_devices in zip(*tower_params):
+           # Note: param_on_devices is [paramX_gpu0, paramX_gpu1, ...]
+           param0 = param_on_devices[0]
+           received = nccl_ops.broadcast(param0)
+           for device, param in zip(devices[1:], param_on_devices[1:]):
+               with tf.device(device):
+                   sync_op = param.assign(received)
+                   sync_ops.append(sync_op)
+   else:
+       params0 = tower_params[0]
+       for device, params in zip(devices, tower_params):
+           with tf.device(device):
+               for param, param0 in zip(params, params0):
+                   sync_op = param.assign(param0.read_value())
+                   sync_ops.append(sync_op)
+   return tf.group(*sync_ops)
 
 def all_avg_gradients(tower_gradvars, devices, param_server_device='/gpu:0'):
     if len(devices) == 1:
@@ -785,33 +783,24 @@ def inference_antnet(net, input_layer):
     x = net.conv(x, 32, (3,3), (2,2))
  # N C H W
     for i, ant_def in enumerate(ant_defs):
-        up_sample, channel, strides, repeat, groups, ratio = ant_def[0]
+        up_sample, out_channels, strides, repeat, groups, ratio = ant_def[0]
         for j in range(repeat):
             with tf.name_scope('antblock_%d_%d' % (i, j)):
                 prev_x = x
                 x = net.conv(x, up_sample * x.get_shape().as_list()[1],
                              (1, 1), (1, 1), 'VALID', 'RELU6', True)
-                print(x.get_shape().as_list())
-
-                x = net.conv(x, up_sample * x.get_shape().as_list()[1],
-                             (3, 3), strides, 'SAME', 'RELU6', True)
-
-                print(x.get_shape().as_list())
-
+                x = net.dwconv(x, (3, 3), strides, 'SAME', 1.0, 'RELU6', True)
                 x = net.squeeze_excitation(x, ratio)
-                print(x.get_shape().as_list())
-
-                x = net.gconv(x, up_sample * x.get_shape().as_list()[1], (1, 1), (1, 1), 'VALID',
-                              groups, activation='LINEAR')
-                print(x.get_shape().as_list())
-
-                if strides[0] == 1:
+                x = net.gconv(x, out_channels, (1, 1), (1, 1), 'VALID', groups,
+                              activation='LINEAR')
+                if prev_x.get_shape().as_list()[1] == out_channels:
                     x = tf.add(prev_x, x)
-                strides = (1, 1)
+                strides = (1,1)
 
     x = net.conv(x, 1280, (1,1), (1,1), 'VALID')
     x = net.pool(x, 'AVG', (7,7), (1,1), 'VALID')
-    x = net.fully_connected(x, 1280)
+    x = tf.reshape(x, x.get_shape().as_list()[:2])
+    x = net.fully_connected(x, 1000)
     return x
 
 
@@ -1239,7 +1228,7 @@ def main():
                          alexnet, googlenet, vgg[11,13,16,19],
                          inception[3,4], resnet[18,34,50,101,152],
                          inception-resnet2.""")
-    cmdline.add_argument('--data_dir', default='/data/ILSVRC_2012/',
+    cmdline.add_argument('--data_dir', default='/data/tmp/',
                          help="""Path to dataset in TFRecord format
                          (aka Example protobufs). Files should be
                          named 'train-*' and 'validation-*'.""")
@@ -1250,7 +1239,7 @@ def main():
     cmdline.add_argument('--num_epochs', default=2, type=int,
                          help="""Number of epochs to run
                          (overrides --num_batches).""")
-    cmdline.add_argument('-g', '--num_gpus', default=1, type=int,
+    cmdline.add_argument('-g', '--num_gpus', default=2, type=int,
                          help="""Number of GPUs to run on.""")
     cmdline.add_argument('--log_dir', default="",
                          help="""Directory in which to write training
